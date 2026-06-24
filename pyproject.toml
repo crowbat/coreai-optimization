@@ -1,6 +1,6 @@
 [build-system]
 build-backend = "setuptools.build_meta"
-requires = [ "setuptools>=42", "wheel" ]
+requires = [ "setuptools>=42" ]
 
 [project]
 name = "coreai-opt"
@@ -177,6 +177,11 @@ environments = [
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
+# Security: only install distributions on PyPI for at least 3 days, giving
+# malicious uploads time to be detected and yanked before they reach CI.
+# coreai-core/coreai-torch are exempted (false) so CI tests their latest releases.
+exclude-newer = "3 days"
+exclude-newer-package = { coreai-core = false, coreai-torch = false }
 # Declare conflicting groups so uv does not error
 conflicts = [
     [
