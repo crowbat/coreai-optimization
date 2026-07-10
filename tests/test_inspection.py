@@ -1395,9 +1395,9 @@ class TestEagerModeSpecific:
         )
         mode._record_outputs(tensor, op)
         key = TensorIdVersion(id(tensor), tensor._version)
-        assert mode._tensor_producers[key] == InputEdge(op=op, output_idx=0)
+        assert mode._tensor_producers.get(key) == InputEdge(op=op, output_idx=0)
         del tensor
-        assert key not in mode._tensor_producers
+        assert mode._tensor_producers.get(key) is None
 
     def test_input_ops_disambiguates_multi_output_external_producer(self) -> None:
         """Verify input_ops correctly separates consumers of distinct outputs from the same op.

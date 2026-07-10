@@ -16,8 +16,9 @@ FORWARD_FUNCTION_NAME = "forward"
 
 def _get_or_create_child(parent: ModuleInfo, module_name: str, module_type: str) -> ModuleInfo:
     """Get an existing child module or create a new one."""
-    if module_name not in parent.child_modules:
-        parent.child_modules[module_name] = ModuleInfo(
+    child = parent.child_modules.get(module_name)
+    if child is None:
+        child = ModuleInfo(
             module_name=module_name,
             module_type=module_type,
             child_modules={},
@@ -25,7 +26,8 @@ def _get_or_create_child(parent: ModuleInfo, module_name: str, module_type: str)
             input_ops={},
             output_ops={},
         )
-    return parent.child_modules[module_name]
+        parent.child_modules[module_name] = child
+    return child
 
 
 def build_module_tree(

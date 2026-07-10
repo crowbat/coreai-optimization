@@ -54,6 +54,22 @@ from .types import (
 )
 
 
+class _TensorProducerMap:
+    """Maps a tensor's (id, version) to its producer edge, auto-evicting on GC."""
+
+    def __init__(self) -> None:
+        self._entries: dict[TensorIdVersion, InputEdge] = {}
+
+    def register(self, tensor: torch.Tensor, edge: InputEdge) -> None:
+        """Associate ``edge`` with ``tensor``; remove the entry once ``tensor`` is GC'd."""
+        key = TensorIdVersion(id(tensor), tensor._version)
+        self._entries[key] = edge
+        weakref.finalize(tensor, self._entries.pop, key, None)
+
+    def get(self, key: TensorIdVersion) -> InputEdge | None:
+        return self._entries.get(key)
+
+
 class _EagerOpDiscoveryMode(TorchFunctionMode):
     """TorchFunctionMode that discovers ops during a forward pass.
 
@@ -91,7 +107,7 @@ class _EagerOpDiscoveryMode(TorchFunctionMode):
 
         # Tensor connectivity: (id, version) → InputEdge (producing op + output slot).
         # Tracks activation tensors only; state tensors are tracked separately below.
-        self._tensor_producers: dict[TensorIdVersion, InputEdge] = {}
+        self._tensor_producers = _TensorProducerMap()
 
         self._states_to_names = {
             id(state): name
@@ -147,22 +163,26 @@ class _EagerOpDiscoveryMode(TorchFunctionMode):
         self._seen_op_names.add(op_info.op_name)
         self.all_ops.append(op_info)
 
-    def _get_or_create_ephemeral(self, tensor_id: int) -> InputEdge:
-        """Return the ephemeral InputEdge for this tensor id, creating one if needed."""
-        op_info = self._ephemeral_op_infos.get(tensor_id)
-        if op_info is None:
-            op_info = OpInfo(
-                op_name=f"untracked_{self._ephemeral_counter}",
-                op_type=None,
-                module_stack=(),
-                source_frames=(),
-                inputs=(),
-                outputs={},
-                is_state=False,
-            )
-            self._ephemeral_op_infos[tensor_id] = op_info
-            self._ephemeral_counter += 1
-        return InputEdge(op=op_info, output_idx=None)
+    def _create_and_register_ephemeral_tensor(self, tensor: torch.Tensor) -> InputEdge:
+        """Create and return the InputEdge for this ephemeral tensor, registering it in
+        self._tensor_producers.
+
+        An ephemeral tensor is defined as a tensor that is not an input to the top level model
+        module, a state tensor, or a tensor produced by a previous operation.
+        """
+        op_info = OpInfo(
+            op_name=f"untracked_{self._ephemeral_counter}",
+            op_type=None,
+            module_stack=(),
+            source_frames=(),
+            inputs=(),
+            outputs={},
+            is_state=False,
+        )
+        input_edge = InputEdge(op=op_info, output_idx=None)
+        self._tensor_producers.register(tensor, input_edge)
+        self._ephemeral_counter += 1
+        return input_edge
 
     def _resolve_boundary_tensor(self, t: torch.Tensor) -> InputEdge | None:
         """Resolve a module-boundary tensor to its producer entry.
@@ -182,7 +202,7 @@ class _EagerOpDiscoveryMode(TorchFunctionMode):
             return entry
         if id(t) in self._states_to_names:
             return None
-        return self._get_or_create_ephemeral(id(t))
+        return self._create_and_register_ephemeral_tensor(t)
 
     def _enter_module(self, name: str) -> Callable:
         def hook(module: nn.Module, inputs: Any) -> None:
@@ -225,9 +245,7 @@ class _EagerOpDiscoveryMode(TorchFunctionMode):
                     strict=False,
                 ):
                     if entry is not None:
-                        key = TensorIdVersion(id(tensor), tensor._version)
-                        self._tensor_producers[key] = entry
-                        weakref.finalize(tensor, self._tensor_producers.pop, key, None)
+                        self._tensor_producers.register(tensor, entry)
             self.parents.pop()
             self.traversed_modules.add(module)
 
@@ -246,9 +264,7 @@ class _EagerOpDiscoveryMode(TorchFunctionMode):
                 is_state=False,
             )
             self._add_op(op_info)
-            key = TensorIdVersion(id(tensor), tensor._version)
-            self._tensor_producers[key] = InputEdge(op=op_info, output_idx=None)
-            weakref.finalize(tensor, self._tensor_producers.pop, key, None)
+            self._tensor_producers.register(tensor, InputEdge(op=op_info, output_idx=None))
 
     def _capture_output_tensors(self, module: nn.Module, inputs: Any, outputs: Any) -> None:
         """Create output-like ops for each module-level output tensor."""
@@ -296,36 +312,43 @@ class _EagerOpDiscoveryMode(TorchFunctionMode):
         # Reverse: outermost forward first (matching graph mode order)
         return tuple(reversed(frames))
 
-    def _resolve_inputs(
-        self, input_tensor_keys: tuple[TensorIdVersion, ...]
-    ) -> tuple[InputEdge, ...]:
+    def _get_or_create_state_edge(self, state_id: int) -> InputEdge:
+        """Return the edge for a registered state tensor, creating its OpInfo on first use.
+
+        State ops are keyed by object id alone — version is irrelevant because states are not
+        produced by ops and their identity is stable for the model's lifetime. The created op
+        carries an empty ``module_stack``, keeping it out of the module tree and boundary lists.
+        """
+        op_info = self._state_op_infos.get(state_id)
+        if op_info is None:
+            op_info = OpInfo(
+                op_name=self._states_to_names[state_id],
+                op_type=None,
+                module_stack=(),
+                source_frames=(),
+                inputs=(),
+                outputs={},
+                is_state=True,
+            )
+            self._add_op(op_info)
+            self._state_op_infos[state_id] = op_info
+        return InputEdge(op=op_info, output_idx=None)
+
+    def _resolve_inputs(self, input_tensors: list[torch.Tensor]) -> tuple[InputEdge, ...]:
         """Look up which previously-recorded ops produced the input tensors.
 
         Returns an ordered tuple of :class:`InputEdge` objects (duplicates
         preserved), each carrying the producing op and its output slot.
         """
-        input_edges: list[InputEdge] = []
-        for key in input_tensor_keys:
+
+        def resolve_input(tensor):
+            key = TensorIdVersion(id(tensor), tensor._version)
             if key.id in self._states_to_names:
-                # State tensor: look up or create by id only — version is irrelevant.
-                op_info = self._state_op_infos.get(key.id)
-                if op_info is None:
-                    op_info = OpInfo(
-                        op_name=self._states_to_names[key.id],
-                        op_type=None,
-                        module_stack=(),
-                        source_frames=(),
-                        inputs=(),
-                        outputs={},
-                        is_state=True,
-                    )
-                    self._add_op(op_info)
-                    self._state_op_infos[key.id] = op_info
-                input_edges.append(InputEdge(op=op_info, output_idx=None))
+                return self._get_or_create_state_edge(key.id)
             else:
                 entry = self._tensor_producers.get(key)
                 if entry is not None:
-                    input_edges.append(entry)
+                    return entry
                 else:
                     # Unknown tensor: not a registered state and not produced by any
                     # intercepted op (e.g. a raw tensor attribute or a global tensor).
@@ -333,16 +356,14 @@ class _EagerOpDiscoveryMode(TorchFunctionMode):
                     # complete and the correct arg index appears in the formatted output.
                     # Ephemeral ops are NOT added to all_ops — they never appear as their
                     # own nodes in the summary tree.
-                    input_edges.append(self._get_or_create_ephemeral(key.id))
+                    return self._create_and_register_ephemeral_tensor(tensor)
 
-        return tuple(input_edges)
+        return tuple(resolve_input(inp) for inp in input_tensors)
 
     def _record_outputs(self, out: Any, op_info: OpInfo) -> None:
         """Record that op_info produced these output tensors."""
         for idx, tensor in enumerate(flatten_tensors_to_list(out)):
-            key = TensorIdVersion(id(tensor), tensor._version)
-            self._tensor_producers[key] = InputEdge(op=op_info, output_idx=idx)
-            weakref.finalize(tensor, self._tensor_producers.pop, key, None)
+            self._tensor_producers.register(tensor, InputEdge(op=op_info, output_idx=idx))
 
     def _register_as_consumer(self, inputs: tuple[InputEdge, ...], consumer: OpInfo) -> None:
         """Append consumer to each producer's outputs dict at the given slot.
@@ -372,13 +393,10 @@ class _EagerOpDiscoveryMode(TorchFunctionMode):
         if kwargs is None:
             kwargs = {}
 
-        # Snapshot input tensor keys BEFORE func() executes.
+        # Process input tensors before func() executes.
         # Critical for in-place ops: func() mutates _version, but
         # the producer was recorded at the pre-mutation version.
-        input_tensor_keys = tuple(
-            TensorIdVersion(id(t), t._version)
-            for t in flatten_tensors_to_list((*args, *kwargs.values()))
-        )
+        input_edges = self._resolve_inputs(flatten_tensors_to_list((*args, *kwargs.values())))
 
         out = func(*args, **kwargs)
 
@@ -414,7 +432,6 @@ class _EagerOpDiscoveryMode(TorchFunctionMode):
 
         module_stack = self._get_module_stack()
         source_frames = self._extract_source_frames()
-        input_edges = self._resolve_inputs(input_tensor_keys)
 
         op_info = OpInfo(
             op_name=op_name,
@@ -427,7 +444,6 @@ class _EagerOpDiscoveryMode(TorchFunctionMode):
         )
 
         self._add_op(op_info)
-
         self._register_as_consumer(input_edges, op_info)
         self._record_outputs(out, op_info)
 
