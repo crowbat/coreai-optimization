@@ -457,9 +457,9 @@ class MLIRConverter(ModelConverter):
         """Async implementation of MLIR inference."""
         with tempfile.TemporaryDirectory(
             prefix="mlir_converter_inference",
-            suffix=".aimodel",
         ) as tmpdir:
-            asset = converted_model.save_asset(Path(tmpdir))
+            asset_path = Path(tmpdir) / "asset.aimodel"
+            asset = converted_model.save_asset(asset_path)
             async with asset.executable(
                 specialization_options=_get_test_specialization_options(),
             ) as ai_model:
