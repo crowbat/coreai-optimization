@@ -3,167 +3,113 @@
 # Use of this source code is governed by a BSD-3-Clause license that can
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-import numpy as _np
 import torch as _torch
 
 
-class _EfficientKMeans:
+def _kmeanspp_init_batched(x: _torch.Tensor, n_clusters: int) -> _torch.Tensor:
+    """Greedy (farthest-point) kmeans++ init, batched over the leading axis.
+
+    ``x`` is ``(P, N, D)``; returns ``(P, K, D)`` initial centroids, chosen
+    independently per partition: a random first centroid, then repeatedly the
+    point farthest from the chosen set (argmax of the min distance).
     """
-    An implementation of k-means which runs entirely on GPU.
+    P, N, _ = x.shape
+    p_idx = _torch.arange(P, device=x.device)
+    centroids = _torch.empty((P, n_clusters, x.shape[-1]), device=x.device, dtype=x.dtype)
+
+    first = _torch.randint(0, N, (P,), device=x.device)
+    centroids[:, 0] = x[p_idx, first]
+    closest = _torch.cdist(x, centroids[:, :1]).squeeze(-1).square()  # (P, N)
+    for k in range(1, n_clusters):
+        far = closest.argmax(dim=-1)  # (P,)
+        centroids[:, k] = x[p_idx, far]
+        d = _torch.cdist(x, centroids[:, k : k + 1]).squeeze(-1).square()
+        closest = _torch.minimum(closest, d)
+    return centroids
+
+
+def _update_centroids_batched(
+    x: _torch.Tensor,
+    labels: _torch.Tensor,
+    n_clusters: int,
+    weights: _torch.Tensor | None,
+    prev: _torch.Tensor,
+) -> _torch.Tensor:
+    """Batched (weighted) mean of the points assigned to each cluster.
+
+    ``x`` is ``(P, N, D)``, ``labels`` is ``(P, N)``, ``prev`` is ``(P, K, D)``.
+    Empty clusters keep their previous centroid (no collapse to the origin).
     """
+    P, N, D = x.shape
+    wl = weights.squeeze(-1) if weights is not None else x.new_ones((P, N))  # (P, N)
+    sums = x.new_zeros((P, n_clusters, D)).scatter_add_(
+        1, labels.unsqueeze(-1).expand(-1, -1, D), x * wl.unsqueeze(-1)
+    )
+    counts = x.new_zeros((P, n_clusters)).scatter_add_(1, labels, wl)  # (P, K)
+    empty = counts == 0
+    centroids = sums / counts.masked_fill(empty, 1.0).unsqueeze(-1)
+    return _torch.where(empty.unsqueeze(-1), prev, centroids)
 
-    def __init__(
-        self,
-        n_clusters: int,
-        init: str,
-        n_init: int = 0,
-        max_iter: int = 100,
-        tol: float = 0.0001,
-    ):
-        self.n_clusters = n_clusters
-        self.n_init = n_init
-        self.max_iter = max_iter
-        self.tol = tol
-        self.labels_ = None
-        self.inertia_ = None
-        self.cluster_centers_ = init
 
-        assert self.max_iter > 0
-        assert self.n_clusters > 0
+def _batched_kmeans(
+    vectors: _torch.Tensor,
+    n_clusters: int,
+    n_init: int = 5,
+    max_iter: int = 300,
+    tol: float = 1e-4,
+    sample_weight: _torch.Tensor | None = None,
+) -> tuple[_torch.Tensor, _torch.Tensor]:
+    """Batched vector k-means over the leading partition axis.
 
-    @staticmethod
-    def _get_cluster_avg(
-        n_clusters: int,
-        indices: _torch.Tensor,
-        vals: _torch.Tensor,
-        sample_weight: _torch.Tensor | None = None,
-    ) -> _torch.Tensor:
-        agg_vals = (
-            vals.float() * sample_weight.float() if sample_weight is not None else vals.float()
-        )
-        v_sum = (
-            _torch.zeros([n_clusters] + list(vals[0].size()))
-            .to(vals.device)
-            .index_add_(0, indices, agg_vals)
-        )
-        weight = (
-            _torch.ones(len(vals), dtype=_torch.int).to(vals.device)
-            if sample_weight is None
-            else sample_weight.squeeze(1).to(vals.device)
-        )
-        v_numel = (
-            _torch.zeros(n_clusters, dtype=weight.dtype)
-            .to(vals.device)
-            .index_add_(0, indices, weight)
-        )
-        v_numel[v_numel == 0] = 1
+    Runs kmeans++ init + Lloyd's independently for each of the ``P`` partitions,
+    fully batched (no Python loop over ``P``), keeping the best of ``n_init``
+    restarts per partition. Device-preserving (runs on ``vectors.device``).
 
-        v_avg = v_sum / v_numel.reshape(-1, 1)
+    Args:
+        vectors (torch.Tensor): Points to cluster, shape ``(P, N, D)``.
+        n_clusters (int): Number of centroids ``K`` per partition.
+        n_init (int): Number of random restarts; the lowest-inertia result is
+            kept independently per partition.
+        max_iter (int): Maximum Lloyd iterations per restart.
+        tol (float): Relative inertia-improvement threshold for early stopping.
+        sample_weight (torch.Tensor | None): Optional per-point weights,
+            shape ``(P, N, 1)``.
 
-        return v_avg.to(vals.dtype)
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Centroids ``(P, K, D)`` (input dtype)
+        and integer labels ``(P, N)``.
+    """
+    P, N, D = vectors.shape
+    x = vectors.float()
+    w = sample_weight.float() if sample_weight is not None else None
 
-    def _kmeans_pp(
-        self, parameters: _torch.Tensor, sample_weight: _torch.Tensor | None = None
-    ) -> None:
-        assert len(parameters) >= self.n_clusters
+    def inertia_of(min_d: _torch.Tensor) -> _torch.Tensor:
+        sq = min_d.square()
+        return (sq * w.squeeze(-1)).sum(dim=-1) if w is not None else sq.sum(dim=-1)
 
-        num_update_list = []
-        INIT_EXIT = 10
-        self.inertia_ = int(1e9)
+    best_inertia = x.new_full((P,), float("inf"))
+    best_centroids = x.new_zeros((P, n_clusters, D))
+    best_labels = x.new_zeros((P, N), dtype=_torch.long)
 
-        # n_init trials for estimating cluster centers
-        for n in range(self.n_init):
-            if n % 2 and sample_weight is not None:
-                centroids = parameters[
-                    _np.random.choice(
-                        len(parameters),
-                        self.n_clusters,
-                        False,
-                        (sample_weight.squeeze() / sample_weight.sum()).cpu().numpy(),
-                    )
-                ]
-            else:
-                centroids = _torch.zeros(
-                    (self.n_clusters, parameters.size(-1)),
-                    device=parameters.device,
-                    dtype=parameters.dtype,
-                )
-                for i in range(self.n_clusters):
-                    if i == 0:
-                        centroids[i] = parameters[_torch.randint(0, len(parameters), [1])]
-                        d_ij_curr = _torch.cdist(centroids[:i], parameters)
-                    else:
-                        d_ij_prev = _torch.cdist(centroids[i - 1 : i], parameters)
-                        d_ij_prev[d_ij_prev == 0] = -int(1e9)
-
-                        d_ij_curr = _torch.cat((d_ij_curr, d_ij_prev), dim=0)
-
-                        c_to_x = _torch.min(d_ij_curr, dim=0)
-                        centroids[i] = parameters[c_to_x[0].argmax()]
-
-            last_inertia = int(1e9)
-            num_update = 0
-            for _ in range(self.max_iter):
-                min_error, labels = _torch.cdist(parameters, centroids).min(dim=-1)
-
-                min_error = (
-                    min_error * (sample_weight.T).sqrt() if sample_weight is not None else min_error
-                )
-
-                centroids.zero_()
-                agg_params = parameters * sample_weight if sample_weight is not None else parameters
-                weights = sample_weight.view(labels.size()) if sample_weight is not None else None
-                centroids.scatter_add_(
-                    0,
-                    labels.view(-1, 1).expand([-1, parameters.size(-1)]),
-                    agg_params,
-                )
-                n_centroids = _torch.bincount(
-                    labels, weights=weights, minlength=self.n_clusters
-                ).view(-1, 1)
-
-                centroids /= n_centroids
-                cur_inertia = min_error.square().sum()
-
-                # update labels and cluster_centers if inertia improves
-                if cur_inertia < self.inertia_:
-                    num_update += 1
-                    self.inertia_ = cur_inertia
-                    self.labels_ = labels
-                    self.cluster_centers_ = centroids
-
-                # exit if there is no improvement in inertia within a tolerance
-                elif last_inertia <= cur_inertia * (1 + self.tol):
-                    break
-
-                last_inertia = cur_inertia
-
-            num_update_list.append(num_update)
-
-            # In every trial, we track number of cluster centre updates.
-            # If number of trials are greater than a specified value INIT_EXIT and
-            # there is no update for the past INIT_EXIT number of trials,
-            # it indicates that the centroids have converged
-            if len(num_update_list) >= INIT_EXIT and sum(num_update_list[-INIT_EXIT:]) == 0:
+    for _ in range(n_init):
+        centroids = _kmeanspp_init_batched(x, n_clusters)
+        prev_inertia: _torch.Tensor | None = None
+        for _ in range(max_iter):
+            min_d, labels = _torch.cdist(x, centroids).min(dim=-1)
+            centroids = _update_centroids_batched(x, labels, n_clusters, w, centroids)
+            inertia = inertia_of(min_d)
+            if prev_inertia is not None and bool(
+                _torch.all(prev_inertia - inertia <= tol * prev_inertia)
+            ):
                 break
+            prev_inertia = inertia
 
-    def fit(
-        self, X: _torch.Tensor, sample_weight: _torch.Tensor | None = None
-    ) -> "_EfficientKMeans":
-        """
-        Compute k-means clustering.
-        """
-        N = len(X)
+        # Final assignment so labels are consistent with the returned centroids.
+        min_d, labels = _torch.cdist(x, centroids).min(dim=-1)
+        inertia = inertia_of(min_d)
+        improved = inertia < best_inertia
+        best_inertia = _torch.where(improved, inertia, best_inertia)
+        best_centroids = _torch.where(improved.view(P, 1, 1), centroids, best_centroids)
+        best_labels = _torch.where(improved.view(P, 1), labels, best_labels)
 
-        assert N >= self.n_clusters, f"too many clusters {self.n_clusters} for {N} samples"
-
-        if self.cluster_centers_ != "kmeans++":
-            raise ValueError(f"init must be 'kmeans++'; got {self.cluster_centers_!r}")
-
-        self._kmeans_pp(X.float(), sample_weight=sample_weight)
-
-        self.cluster_centers_ = _EfficientKMeans._get_cluster_avg(
-            self.n_clusters, self.labels_, X, sample_weight=sample_weight
-        )
-
-        return self
+    return best_centroids.to(vectors.dtype), best_labels

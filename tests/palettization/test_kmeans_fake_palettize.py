@@ -2267,3 +2267,16 @@ def test_check_compatible(axis, group_size):
     )
     palettizer = _KMeansFakePalettize(**spec.__dict__)
     assert palettizer.check_compatible(torch.randn(8, 8)) is (tensor.shape[axis] % group_size == 0)
+
+
+def test_split_into_groups_raises_on_indivisible_group_size():
+    """``_split_into_groups`` raises ``_IncompatibleGranularityError`` (not a bare reshape
+    error) when group_size does not divide the axis, preserving the graceful-disable path.
+    """
+    spec = PalettizationSpec(
+        n_bits=4, granularity=PerGroupedChannelGranularity(axis=0, group_size=4), cluster_dim=2
+    )
+    palettizer = _KMeansFakePalettize(**spec.__dict__)
+    weight_2d = torch.randn(10, 8)  # 10 not divisible by group_size 4
+    with pytest.raises(_IncompatibleGranularityError):
+        palettizer._split_into_groups(weight_2d, axis=0)
