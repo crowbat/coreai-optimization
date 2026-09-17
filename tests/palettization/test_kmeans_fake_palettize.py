@@ -2219,3 +2219,16 @@ def test_from_cluster_vectors_rejects_element_count_mismatch():
     vectors = torch.randn(1, 5, 2)  # 5 * 2 = 10 elements, but rows * cols = 8
     with pytest.raises(ValueError):
         palettizer._from_cluster_vectors(vectors, rows=4, cols=2)
+
+
+def test_split_into_groups_raises_on_indivisible_group_size():
+    """``_split_into_groups`` raises ``_IncompatibleGranularityError`` (not a bare reshape
+    error) when group_size does not divide the axis, preserving the graceful-disable path.
+    """
+    spec = PalettizationSpec(
+        n_bits=4, granularity=PerGroupedChannelGranularity(axis=0, group_size=4), cluster_dim=2
+    )
+    palettizer = _KMeansFakePalettize(**spec.__dict__)
+    weight_2d = torch.randn(10, 8)  # 10 not divisible by group_size 4
+    with pytest.raises(_IncompatibleGranularityError):
+        palettizer._split_into_groups(weight_2d, axis=0)

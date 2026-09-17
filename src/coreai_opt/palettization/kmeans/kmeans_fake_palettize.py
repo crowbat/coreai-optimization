@@ -32,7 +32,7 @@ from coreai_opt.quantization.spec import (
     QuantizationSpec,
 )
 
-from ._efficient_kmeans import _EfficientKMeans
+from ._efficient_kmeans import _batched_kmeans
 from .kmeans_support_mixins import _LinearPalettizationMixin
 from .supported_ops_registry import _KMeansPalettizerSupportedOpsRegistry
 
@@ -358,6 +358,12 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         if isinstance(self.granularity, PerGroupedChannelGranularity):
             rows, cols = weight_2d.shape
             group_size = self.granularity.group_size
+            dim = rows if axis == 0 else cols
+            if dim % group_size != 0:
+                raise _IncompatibleGranularityError(
+                    f"Tensor size {dim} along axis {axis} is not divisible by "
+                    f"group_size {group_size}."
+                )
             if axis == 0:
                 return weight_2d.reshape(rows // group_size, group_size, cols)
             return weight_2d.reshape(rows, cols // group_size, group_size).permute(1, 0, 2)
@@ -409,6 +415,9 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         num_clusters, cluster_dim)`` tensor, and ``indices`` is the per-element
         cluster assignment produced directly by the clustering algorithm.
         """
+        if self.cluster_dim > 1:
+            return self._cluster_to_centroids_batched(original_weights, sensitivities)
+
         weight = original_weights.cpu()
         block_weights_to_cluster, axis = self._scale_reshape_and_block(weight)
 
@@ -429,22 +438,83 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         for block_weight, block_sensitivity in zip(
             block_weights_to_cluster, block_sensitivities, strict=True
         ):
-            if self.cluster_dim == 1:
-                centroids, clusters = self._cluster_weights_1d(block_weight, block_sensitivity)
-            else:
-                centroids, clusters = self._cluster_weights_2d(block_weight, block_sensitivity)
+            centroids, clusters = self._cluster_weights_1d(block_weight, block_sensitivity)
             centroids = self._pad_lut_to_num_clusters(centroids, num_clusters)
             centroids_per_block.append(centroids.to(weight.dtype))
             block_indices.append(self._build_block_indices(clusters, block_weight).to(torch.uint8))
 
-        stacked = torch.stack(centroids_per_block)
-        # Keep a trailing vector dimension so shape is (num_blocks,
-        # num_clusters, cluster_dim) for both scalar and vector palettization.
-        centroids_pnd = stacked if self.cluster_dim > 1 else stacked.unsqueeze(-1)
+        # Keep a trailing vector dimension so shape is (num_blocks, num_clusters, 1).
+        centroids_pnd = torch.stack(centroids_per_block).unsqueeze(-1)
         centroids_pnd = centroids_pnd.detach().clone().to(original_weights.device)
 
         indices = self._combine_block_indices(block_indices, axis, original_weights)
         return centroids_pnd, indices
+
+    def _cluster_to_centroids_batched(
+        self, original_weights: torch.Tensor, sensitivities: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Vector (``cluster_dim > 1``) clustering, batched over all partitions.
+
+        Always invoked from the ``@torch.no_grad`` ``_cluster_to_centroids``.
+
+        Runs a single batched k-means over the ``(P, N, D)`` vectors instead of
+        one k-means per partition. Device-preserving (runs on the weight's device).
+        """
+        axis = self._resolved_axis
+        weight = original_weights
+        if self.enable_per_channel_scale:
+            weight = self._scale_by_per_channel_scale(weight)
+        weight_2d = self.reshape_strategy.reshape_for_kmeans(weight, axis)
+        groups = self._split_into_groups(weight_2d, axis)  # (P, group_rows, group_cols)
+        group_shape = groups.shape[1:]
+        vectors = self._to_cluster_vectors(groups)  # (P, N, D)
+        num_partitions, num_vectors, cluster_dim = vectors.shape
+
+        sample_weight = None
+        if sensitivities is not None:
+            sens = sensitivities.float() if sensitivities.dtype == torch.bfloat16 else sensitivities
+            sens_2d = self.reshape_strategy.reshape_for_kmeans(sens, axis)
+            sens_vectors = self._to_cluster_vectors(self._split_into_groups(sens_2d, axis))
+            sample_weight = sens_vectors.sum(dim=-1, keepdim=True)  # (P, N, 1)
+
+        num_clusters = min(num_vectors, 2**self.n_bits)
+        centroids, labels = _batched_kmeans(vectors, num_clusters, sample_weight=sample_weight)
+
+        # Pad to 2**n_bits when k-means produced fewer centroids (num_vectors < target).
+        target = 2**self.n_bits
+        if num_clusters < target:
+            pad = centroids[:, -1:].expand(num_partitions, target - num_clusters, cluster_dim)
+            centroids = torch.cat([centroids, pad], dim=1)
+
+        centroids_pnd = centroids.to(weight.dtype).detach().clone().to(original_weights.device)
+        indices = self._combine_indices_batched(labels, group_shape, axis, original_weights)
+        return centroids_pnd, indices
+
+    def _combine_indices_batched(
+        self,
+        labels: torch.Tensor,
+        group_shape: torch.Size,
+        axis: int,
+        original_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Assemble batched ``(P, N)`` cluster labels into weight-shaped uint8 indices.
+
+        Batched inverse of ``_build_block_indices`` + ``_combine_block_indices``:
+        reshapes labels back onto the reduced (``rows // cluster_dim``) grid and
+        merges the partitions. Indices are CPU-resident, matching the LUT.
+        """
+        num_partitions = labels.shape[0]
+        rows, cols = group_shape
+        reduced_rows = rows // self.cluster_dim
+        # Inverse of _to_cluster_vectors on the reduced (rows // cluster_dim) grid.
+        reduced = labels.reshape(num_partitions, cols, reduced_rows).transpose(-2, -1)
+        indices_2d = self._merge_groups(reduced, axis)
+        indices_shape = list(original_weights.shape)
+        indices_shape[0] //= self.cluster_dim
+        indices_2d = self.reshape_strategy.reshape_to_original(
+            indices_2d, axis, torch.Size(indices_shape)
+        )
+        return indices_2d.to(torch.uint8).cpu()
 
     @torch.no_grad()
     def _assign_indices(
@@ -700,48 +770,6 @@ class _KMeansFakePalettize(_FakePalettizeImplBase):
         clusters = torch.from_numpy(np.array(kmeans_results.clusters))
 
         return centroids, clusters
-
-    def _cluster_weights_2d(
-        self,
-        block_weight: torch.Tensor,
-        block_sensitivity: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Cluster weights using vector k-means where each centroid is a vector
-        of length cluster_dim, i.e., cluster_dim > 1.
-
-        Vectorization is always along axis 0 (output channel axis).
-        """
-        num_clusters = 2**self.n_bits
-
-        # Vectorize: reshape block_weight to (N, cluster_dim) along axis 0
-        vectorized = self._vectorize_block(block_weight)
-        num_clusters = min(len(vectorized), num_clusters)
-
-        # Prepare sample weights from sensitivities
-        sample_weight = None
-        if block_sensitivity is not None:
-            sens_vectorized = self._vectorize_block(block_sensitivity)
-            # Sum sensitivities along cluster_dim for per-vector importance
-            sample_weight = sens_vectorized.sum(dim=-1, keepdim=True)
-
-        # Move to GPU if available
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        vectorized = vectorized.to(device)
-        if sample_weight is not None:
-            sample_weight = sample_weight.to(device)
-
-        kmeans = _EfficientKMeans(
-            n_clusters=num_clusters,
-            init="kmeans++",
-            n_init=5,
-            max_iter=300,
-        ).fit(vectorized.float(), sample_weight=sample_weight)
-
-        centroids = kmeans.cluster_centers_.cpu()
-        labels = kmeans.labels_.cpu()
-
-        return centroids, labels
 
     def _vectorize_block(self, tensor: torch.Tensor) -> torch.Tensor:
         """Reshape a 2D tensor into (N, cluster_dim) vectors for k-means.
